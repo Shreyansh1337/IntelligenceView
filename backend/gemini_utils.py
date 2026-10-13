@@ -3,7 +3,11 @@ import os
 import time
 
 import numpy as np
-import sounddevice as sd
+
+if os.getenv("RENDER") == "true":
+    sd = None
+else:
+    import sounddevice as sd
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -720,7 +724,9 @@ COMPLETION:
             try:
                 samplerate = 16000
                 blocksize = 1024
-
+                
+                if sd is None:
+                    raise RuntimeError("Local microphone capture is unavailable on the hosted backend.")
                 with sd.RawInputStream(
                     samplerate=samplerate,
                     blocksize=blocksize,
