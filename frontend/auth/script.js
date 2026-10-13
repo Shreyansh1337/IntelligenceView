@@ -3,11 +3,7 @@ const sign_in_btn = document.querySelector("#sign-in-btn");
 const sign_up_btn = document.querySelector("#sign-up-btn");
 const container = document.querySelector(".container");
 
-const API_URL =
-  window.location.hostname === "localhost" ||
-  window.location.hostname === "127.0.0.1"
-    ? "http://127.0.0.1:8000"
-    : "https://intelligenceview.onrender.com";
+const API_URL = "https://intelligenceview.onrender.com";q
 
 const signupForm = document.querySelector(".sign-up-form");
 const loginForm = document.querySelector(".sign-in-form");
