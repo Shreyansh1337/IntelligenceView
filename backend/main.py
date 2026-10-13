@@ -3,7 +3,16 @@ import os
 from io import BytesIO
 
 import jwt
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pypdf import PdfReader
@@ -12,6 +21,7 @@ from sqlalchemy.orm import Session
 from backend.gemini_utils import (
     active_interviews,
     analyze_resume,
+    browser_audio_sessions,
     completed_interviews,
     evaluate_intevriew,
     start_live_interview,
@@ -281,23 +291,33 @@ async def start_interview(
     }
 
 @app.post("/interview/end/{interview_id}")
-async def end_interview(interview_id: int,current_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+async def end_interview(
+    interview_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    interview = (
+        db.query(Interview)
+        .filter(
+            Interview.id == interview_id,
+            Interview.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if interview is None:
+        raise HTTPException(status_code=404, detail="Interview Not Found!")
 
     event = active_interviews.get(interview_id)
 
     if event is None:
         raise HTTPException(status_code=404, detail="Interview Is Not Active!")
 
-    interview = db.query(Interview).filter(Interview.id== interview_id, Interview.user_id==current_user.id).first()
-
-    if interview is None:
-        raise HTTPException(status_code=404, detail="Interview Not Found!")
-
     event.set()
 
     return {
         "message": "Interview ending",
-        "interview_id": interview_id
+        "interview_id": interview_id,
     }
 
 @app.get("/interviews")
@@ -399,3 +419,267 @@ async def get_interview_status(
     return {
         "completed": interview_id in completed_interviews
     }
+
+
+@app.websocket("/interview/ws/{interview_id}")
+async def interview_audio_websocket(
+    websocket: WebSocket,
+    interview_id: int,
+    token: str,
+):
+    db = SessionLocal()
+    connected = False
+    receive_task = None
+    send_task = None
+
+    try:
+        # Authenticate the connection.
+        try:
+            payload = jwt.decode(
+                token,
+                os.getenv("JWT_SECRET_KEY"),
+                algorithms=[os.getenv("JWT_ALGORITHM")],
+            )
+            user_id = payload.get("user_id")
+
+            if user_id is None:
+                await websocket.close(
+                    code=1008,
+                    reason="Invalid token",
+                )
+                return
+
+        except jwt.InvalidTokenError:
+            await websocket.close(
+                code=1008,
+                reason="Invalid token",
+            )
+            return
+
+        # Confirm that the interview belongs to this user.
+        interview = (
+            db.query(Interview)
+            .filter(
+                Interview.id == interview_id,
+                Interview.user_id == user_id,
+            )
+            .first()
+        )
+
+        if interview is None:
+            await websocket.close(
+                code=1008,
+                reason="Interview not found",
+            )
+            return
+
+        # Wait for the Gemini Live session to become available.
+        browser_audio_session = None
+
+        for _ in range(150):
+            browser_audio_session = browser_audio_sessions.get(
+                interview_id
+            )
+
+            if browser_audio_session is not None:
+                break
+
+            if interview_id in completed_interviews:
+                break
+
+            await asyncio.sleep(0.2)
+
+        if browser_audio_session is None:
+            await websocket.close(
+                code=1011,
+                reason="Audio session unavailable",
+            )
+            return
+
+        await websocket.accept()
+        connected = True
+
+        input_queue = browser_audio_session["input_queue"]
+        output_queue = browser_audio_session["output_queue"]
+        playback_finished_event = browser_audio_session[
+            "playback_finished_event"
+        ]
+
+        stop_event = active_interviews.get(interview_id)
+
+        async def receive_browser_audio():
+            try:
+                while True:
+                    message = await websocket.receive()
+
+                    if message["type"] == "websocket.disconnect":
+                        break
+
+                    audio_data = message.get("bytes")
+
+                    if audio_data:
+                        await input_queue.put(audio_data)
+                        continue
+
+                    text_data = message.get("text")
+
+                    if text_data:
+                        import json
+
+                        try:
+                            payload = json.loads(text_data)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if payload.get("type") == "playback_finished":
+                            playback_finished_event.set()
+                            print(
+                                "Browser confirmed final audio playback.",
+                                flush=True,
+                            )
+
+            except WebSocketDisconnect:
+                pass
+
+            finally:
+                # A disconnected browser must not leave the interview running.
+                if (
+                    stop_event is not None
+                    and not playback_finished_event.is_set()
+                ):
+                    stop_event.set()
+
+                await input_queue.put(None)
+
+        async def send_browser_audio():
+            while True:
+                # A normal stop ends streaming immediately. During normal
+                # final playback, stop_event remains unset until the browser
+                # acknowledges that playback has finished.
+                if stop_event is not None and stop_event.is_set():
+                    break
+
+                try:
+                    audio_data = await asyncio.wait_for(
+                        output_queue.get(),
+                        timeout=0.25,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                if audio_data is None:
+                    await websocket.send_json({
+                        "type": "audio_end",
+                        "final": False,
+                    })
+                    continue
+
+                if isinstance(audio_data, dict):
+                    if audio_data.get("type") == "final_audio_end":
+                        await websocket.send_json({
+                            "type": "audio_end",
+                            "final": True,
+                        })
+
+                        # Keep the socket alive until the browser confirms
+                        # playback, or the interview is manually stopped.
+                        playback_wait = asyncio.create_task(
+                            playback_finished_event.wait()
+                        )
+                        stop_wait = asyncio.create_task(
+                            stop_event.wait()
+                        ) if stop_event is not None else None
+
+                        wait_tasks = {playback_wait}
+
+                        if stop_wait is not None:
+                            wait_tasks.add(stop_wait)
+
+                        try:
+                            await asyncio.wait(
+                                wait_tasks,
+                                timeout=30,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        finally:
+                            for task in wait_tasks:
+                                if not task.done():
+                                    task.cancel()
+
+                            await asyncio.gather(
+                                *wait_tasks,
+                                return_exceptions=True,
+                            )
+
+                        break
+
+                    continue
+
+                await websocket.send_bytes(audio_data)
+
+        receive_task = asyncio.create_task(receive_browser_audio())
+        send_task = asyncio.create_task(send_browser_audio())
+
+        done, pending = await asyncio.wait(
+            {receive_task, send_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in pending:
+            task.cancel()
+
+        await asyncio.gather(
+            *pending,
+            return_exceptions=True,
+        )
+
+        for task in done:
+            if not task.cancelled():
+                error = task.exception()
+
+                if error is not None:
+                    raise error
+
+    except WebSocketDisconnect:
+        print(
+            f"Browser audio disconnected for interview {interview_id}",
+            flush=True,
+        )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as e:
+        print(
+            "WEBSOCKET AUDIO ERROR:",
+            repr(e),
+            flush=True,
+        )
+
+    finally:
+        tasks = [
+            task
+            for task in (receive_task, send_task)
+            if task is not None
+        ]
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        if tasks:
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
+
+        if connected:
+            try:
+                await websocket.close(
+                    code=1000,
+                    reason="Audio connection closed",
+                )
+            except Exception:
+                pass
+
+        db.close()

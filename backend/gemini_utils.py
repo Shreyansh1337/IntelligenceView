@@ -21,6 +21,13 @@ load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 active_interviews= {}
+browser_audio_sessions = {}
+def create_browser_audio_session():
+    return {
+        "input_queue": asyncio.Queue(),
+        "output_queue": asyncio.Queue(),
+        "playback_finished_event": asyncio.Event(),
+    }
 class Education(BaseModel):
     degree: str
     institution: str
@@ -426,7 +433,12 @@ async def start_live_interview(candidate_context, interview_id, db, end_intervie
 
     # audio_chunks = []
     gemini_speaking = asyncio.Event()
-    audio_queue = asyncio.Queue()
+
+    browser_audio_session = create_browser_audio_session()
+    browser_audio_sessions[interview_id] = browser_audio_session
+
+    input_audio_queue = browser_audio_session["input_queue"]
+    audio_queue = browser_audio_session["output_queue"]
     # missed_responses = 0
 
 
@@ -688,78 +700,101 @@ COMPLETION:
 
         )
         timeout_task = asyncio.create_task(interview_timeout())
-#newly added
-        async def play_gemini_audio():
 
-            try:
-                with sd.RawOutputStream(
-                    samplerate=24000,
-                    channels=1,
-                    dtype="int16"
-                ) as output_stream:
+        # async def play_gemini_audio():
 
-                    while not end_interview.is_set():
+        #     try:
+        #         with sd.RawOutputStream(
+        #             samplerate=24000,
+        #             channels=1,
+        #             dtype="int16"
+        #         ) as output_stream:
 
-                        audio_data = await audio_queue.get()
+        #             while not end_interview.is_set():
+
+        #                 audio_data = await audio_queue.get()
 
 
-                        if audio_data is None:
-                            gemini_speaking.clear()
+        #                 if audio_data is None:
+        #                     gemini_speaking.clear()
 
-                            print("🎙️ GEMINI FINISHED — MIC UNBLOCKED")
-                            continue
+        #                     print("🎙️ GEMINI FINISHED — MIC UNBLOCKED")
+        #                     continue
 
-                        await asyncio.to_thread(
-                            output_stream.write,
-                            audio_data
-                        )
+        #                 await asyncio.to_thread(
+        #                     output_stream.write,
+        #                     audio_data
+        #                 )
 
-            except asyncio.CancelledError:
-                pass
+        #     except asyncio.CancelledError:
+        #         pass
 
-            except Exception as e:
-                print("AUDIO PLAYBACK ERROR:", repr(e))
-#ends here
+        #     except Exception as e:
+        #         print("AUDIO PLAYBACK ERROR:", repr(e))
+
+
         async def send_microphone_audio():
             try:
-                samplerate = 16000
-                blocksize = 1024
-                
-                if sd is None:
-                    raise RuntimeError("Local microphone capture is unavailable on the hosted backend.")
-                with sd.RawInputStream(
-                    samplerate=samplerate,
-                    blocksize=blocksize,
-                    channels=1,
-                    dtype="int16"
+                while not end_interview.is_set():
+                    audio_data = await input_audio_queue.get()
 
-                ) as stream:
+                    if audio_data is None:
+                        break
 
-                    print("Microphone started. Speak now...")
-
-                    while not end_interview.is_set():
-                        audio_data, _ = await asyncio.to_thread(
-                            stream.read,
-                            blocksize
+                    await session.send_realtime_input(
+                        audio=types.Blob(
+                            data=audio_data,
+                            mime_type="audio/pcm;rate=16000",
                         )
+                    )
 
-                        audio_data = bytes(audio_data)
-                        if not gemini_speaking.is_set():
-                            try:
-                                await session.send_realtime_input(
-                                    audio=types.Blob(
-                                        data=audio_data,
-                                        mime_type="audio/pcm;rate=16000"
-                                    )
-                                )
-                            except Exception as e:
-                                print("SEND AUDIO ERROR:", repr(e))
-
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                print("MICROPHONE TASK ERROR:", repr(e))
+                print("BROWSER AUDIO SEND ERROR:", repr(e), flush=True)
+                end_interview.set()
+#old one using sounddevice
+        #async def send_microphone_audio():
+        #     try:
+        #         samplerate = 16000
+        #         blocksize = 1024
+                
+        #         if sd is None:
+        #             raise RuntimeError("Local microphone capture is unavailable on the hosted backend.")
+        #         with sd.RawInputStream(
+        #             samplerate=samplerate,
+        #             blocksize=blocksize,
+        #             channels=1,
+        #             dtype="int16"
 
+        #         ) as stream:
 
+        #             print("Microphone started. Speak now...")
+
+        #             while not end_interview.is_set():
+        #                 audio_data, _ = await asyncio.to_thread(
+        #                     stream.read,
+        #                     blocksize
+        #                 )
+
+        #                 audio_data = bytes(audio_data)
+        #                 if not gemini_speaking.is_set():
+        #                     try:
+        #                         await session.send_realtime_input(
+        #                             audio=types.Blob(
+        #                                 data=audio_data,
+        #                                 mime_type="audio/pcm;rate=16000"
+        #                             )
+        #                         )
+        #                     except Exception as e:
+        #                         print("SEND AUDIO ERROR:", repr(e))
+
+        #     except Exception as e:
+        #         print("MICROPHONE TASK ERROR:", repr(e))
+
+        interview_completion_requested = False
         async def receive_gemini():
+            nonlocal interview_completion_requested
             gemini_text=""
             candidate_text=""
             try:
@@ -808,15 +843,22 @@ COMPLETION:
                                     audio_data = part.inline_data.data
 
                                     await audio_queue.put(audio_data)
-                        if response.server_content.turn_complete:
 
+                        if response.server_content.turn_complete:
                             gemini_message = gemini_text.strip()
 
                             if "INTERVIEW_COMPLETE" in gemini_message:
-                                end_interview.set()
-                                print("🏁 Gemini marked the interview as complete")
-                            gemini_message = gemini_message.replace("INTERVIEW_COMPLETE", "").strip()
-                            print("Gemini:", gemini_message)
+                                interview_completion_requested = True
+                                print(
+                                    "🏁 Gemini marked the interview as complete",
+                                    flush=True,
+                                )
+
+                            gemini_message = gemini_message.replace(
+                                "INTERVIEW_COMPLETE", ""
+                            ).strip()
+
+                            print("Gemini:", gemini_message, flush=True)
 
                             if gemini_message:
                                 db.add(
@@ -824,33 +866,33 @@ COMPLETION:
                                         interview_id=interview_id,
                                         speaker="gemini",
                                         message=gemini_message,
-                                        is_final=1
+                                        is_final=1,
                                     )
                                 )
                                 db.commit()
 
                             gemini_text = ""
 
+                            if interview_completion_requested:
+                                
+                                await audio_queue.put({"type": "final_audio_end"})
+                                print(
+                                    "Final Gemini audio queued; waiting for browser playback acknowledgment.",
+                                    flush=True,
+                                )
+                                return
+
+                            
                             await audio_queue.put(None)
-#ends here
-                    if end_interview.is_set():
-                        print("Ending interview......")
-                        break
+                            
 
             except Exception as e:
                 print("RECEIVE GEMINI ERROR:", repr(e))
 
 
-        playback_task = asyncio.create_task(play_gemini_audio())
-        microphone_task = asyncio.create_task(
-            send_microphone_audio()
-        )
 
-        receive_task = asyncio.create_task(
-            receive_gemini()
-        )
-
-
+        microphone_task = asyncio.create_task(send_microphone_audio())
+        receive_task = asyncio.create_task(receive_gemini())
         end_wait_task = asyncio.create_task(end_interview.wait())
 
         try:
@@ -859,33 +901,85 @@ COMPLETION:
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            if end_wait_task in done and not receive_task.done():
+            if end_wait_task in done:
                 receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
 
-            await asyncio.gather(receive_task, return_exceptions=True)
+            elif receive_task in done:
+                await asyncio.gather(receive_task, return_exceptions=True)
+
+                if interview_completion_requested:
+                    playback_finished_event = browser_audio_session[
+                        "playback_finished_event"
+                    ]
+
+                    print(
+                        "Waiting for final audio playback acknowledgment...",
+                        flush=True,
+                    )
+
+                    playback_wait_task = asyncio.create_task(
+                        playback_finished_event.wait()
+                    )
+                    stop_wait_task = asyncio.create_task(end_interview.wait())
+
+                    try:
+                        _, unfinished = await asyncio.wait(
+                            {playback_wait_task, stop_wait_task},
+                            timeout=35,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+
+                        if not playback_finished_event.is_set():
+                            print(
+                                "Final audio acknowledgment not received; "
+                                "ending interview safely.",
+                                flush=True,
+                            )
+
+                    finally:
+                        for task in (playback_wait_task, stop_wait_task):
+                            if not task.done():
+                                task.cancel()
+
+                        await asyncio.gather(
+                            playback_wait_task,
+                            stop_wait_task,
+                            return_exceptions=True,
+                        )
+
+                    end_interview.set()
 
         except asyncio.CancelledError:
-            print("Interview stopped.")
+            print("Interview stopped.", flush=True)
+            raise
 
         finally:
             end_wait_task.cancel()
             await asyncio.gather(end_wait_task, return_exceptions=True)
-            end_interview.set()
-            print("✅ flag is set")
 
-            sd.stop()
-            print("✅ audio stop")
+            end_interview.set()
+            print("✅ flag is set", flush=True)
 
             microphone_task.cancel()
             receive_task.cancel()
             timeout_task.cancel()
-            playback_task.cancel()
-            await asyncio.sleep(0)
+
+            await asyncio.gather(
+                microphone_task,
+                receive_task,
+                timeout_task,
+                return_exceptions=True,
+            )
+
+            browser_audio_sessions.pop(interview_id, None)
+
+            if active_interviews.get(interview_id) is end_interview:
+                active_interviews.pop(interview_id, None)
 
             print("RECEIVE TASK DONE:", receive_task.done())
             print("MIC TASK DONE:", microphone_task.done())
             print("TIMEOUT TASK DONE:", timeout_task.done())
-
             print("🏁 Interview stopped completely")
 
 
@@ -936,4 +1030,4 @@ if __name__ == "__main__":
     )
 
     db.close()
-    #uvicorn backend.main:app --host 127.0.0.1 --port 8000
+    
