@@ -36,7 +36,7 @@ function Interview() {
 
       try {
         const response = await fetch(
-          `http://127.0.0.1:8000/interview/status/${interviewId}`,
+          `https://intelligenceview.onrender.com/interview/status/${interviewId}`,
           {
             headers: {
               Authorization: `Bearer ${token}`,
@@ -92,7 +92,7 @@ function Interview() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:8000/interview/end/${interviewId}`,
+        `https://intelligenceview.onrender.com/interview/end/${interviewId}`,
         {
           method: "POST",
           headers: {
@@ -112,7 +112,7 @@ function Interview() {
       // Check its status before showing an error.
       if (response.status === 404) {
         const statusResponse = await fetch(
-          `http://127.0.0.1:8000/interview/status/${interviewId}`,
+          `https://intelligenceview.onrender.com/interview/status/${interviewId}`,
           {
             headers: {
               Authorization: `Bearer ${token}`,

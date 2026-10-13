@@ -20,7 +20,7 @@ import { useNavigate } from "react-router-dom";
 import { useTheme } from "../context/ThemeContext.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
 import ThemeToggle from "../components/ThemeToggle.jsx";
-const API_URL = "http://127.0.0.1:8000";
+const API_URL = "https://intelligenceview.onrender.com";
 function Dashboard() {
 
   const { isDarkMode } = useTheme();
