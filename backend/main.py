@@ -25,6 +25,9 @@ from .schemas import LoginRequest, SignupRequest
 from .security import create_access_token, hash_password, verify_password
 
 app = FastAPI()
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 background_interview_tasks = set()
 @app.middleware("http")
 async def debug_requests(request, call_next):
