@@ -26,7 +26,7 @@ class Interview(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resume_filename= Column(String(255), nullable=True)
     score= Column(Integer, nullable=True)
-    area_to_improve= Column(String(255),nullable=True)
+    area_to_improve= Column(Text,nullable=True)
     user = relationship(
         "User",
         back_populates="interviews"
